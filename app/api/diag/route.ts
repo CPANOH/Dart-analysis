@@ -43,8 +43,25 @@ function probe(
   });
 }
 
+const FIN_URL = `${BASE}/fnlttSinglAcnt.json?crtfc_key=${KEY}&corp_code=00126380&bsns_year=2023&reprt_code=11011`;
+
 export async function GET() {
-  const withUA = await probe("corp_withUA_v4", CORP_URL, { headers: { "User-Agent": UA }, family: 4 }, 25000);
-  const noUA = await probe("corp_noUA_v4", CORP_URL, { family: 4 }, 25000);
-  return NextResponse.json({ keyLen: KEY.length, withUA, noUA });
+  // 단일 재무 JSON 호출 속도 (작은 응답) — 스로틀 여부 확인
+  const fin1 = await probe("fin_single", FIN_URL, { headers: { "User-Agent": UA }, family: 4 }, 25000);
+  // 재무 호출 10개 병렬 — 총 처리량이 IP 전체로 제한되는지 확인
+  const t0 = Date.now();
+  const finParallel = await Promise.all(
+    Array.from({ length: 10 }, (_, i) =>
+      probe(
+        `fin_p${i}`,
+        `${BASE}/fnlttSinglAcnt.json?crtfc_key=${KEY}&corp_code=00126380&bsns_year=${2023 - i}&reprt_code=11011`,
+        { headers: { "User-Agent": UA }, family: 4 },
+        25000
+      )
+    )
+  );
+  const parallelMs = Date.now() - t0;
+  const okCount = finParallel.filter((r) => r.ok).length;
+  const avgBytes = Math.round(finParallel.reduce((s, r) => s + (r.bytes as number), 0) / 10);
+  return NextResponse.json({ keyLen: KEY.length, fin1, parallelMs, okCount, avgBytes });
 }
