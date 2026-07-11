@@ -6,9 +6,12 @@ export const maxDuration = 60;
 // DART(전자공시시스템)는 한국 소재 서버이므로 서울 리전에서 실행해 지연을 줄인다.
 export const preferredRegion = "icn1";
 
-function currentDefaultYears(): number[] {
+const MAX_COMPANIES = 5;
+const MAX_YEARS = 10;
+
+function currentDefaultYears(count: number): number[] {
   const y = new Date().getFullYear() - 1;
-  return [y, y - 1, y - 2];
+  return Array.from({ length: count }, (_, i) => y - i);
 }
 
 export async function POST(req: NextRequest) {
@@ -24,13 +27,20 @@ export async function POST(req: NextRequest) {
   const companies: string[] = (body?.companies ?? []).filter(
     (c: unknown) => typeof c === "string" && c.trim()
   );
+  const yearCount =
+    Number.isInteger(body?.yearCount) && body.yearCount >= 1 && body.yearCount <= MAX_YEARS
+      ? body.yearCount
+      : MAX_YEARS;
   const years: number[] =
-    Array.isArray(body?.years) && body.years.length === 3
-      ? body.years.map((y: unknown) => Number(y))
-      : currentDefaultYears();
+    Array.isArray(body?.years) && body.years.length > 0
+      ? body.years.map((y: unknown) => Number(y)).slice(0, MAX_YEARS)
+      : currentDefaultYears(yearCount);
 
-  if (companies.length < 1 || companies.length > 3) {
-    return NextResponse.json({ error: "회사명을 1~3개 입력하세요." }, { status: 400 });
+  if (companies.length < 1 || companies.length > MAX_COMPANIES) {
+    return NextResponse.json(
+      { error: `회사명을 1~${MAX_COMPANIES}개 입력하세요.` },
+      { status: 400 }
+    );
   }
 
   let results: CompanyResult[];

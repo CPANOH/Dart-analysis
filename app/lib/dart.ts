@@ -1,26 +1,43 @@
 import AdmZip from "adm-zip";
 import { XMLParser } from "fast-xml-parser";
+import https from "node:https";
 
 const BASE_URL = "https://opendart.fss.or.kr/api";
 const REPRT_CODE_ANNUAL = "11011";
+// DART 서버는 User-Agent가 없는 요청을 응답 없이 드롭하는 경우가 있어 브라우저형 UA를 지정한다.
+const DART_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  Connection: "close",
+};
 
+// Vercel의 Node.js fetch(undici)가 opendart.fss.or.kr의 일부 엔드포인트에서 응답을
+// 받지 못하고 멈추는 현상이 있어, node:https 모듈로 직접 요청해 우회한다.
+function httpsGet(url: string, timeoutMs = 15000): Promise<{ status: number; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    // family: 4 → IPv6 경로가 응답 없이 멈추는 환경(일부 서버리스 네트워크)을 우회하기 위해 IPv4를 강제한다.
+    const req = https.get(url, { headers: DART_HEADERS, timeout: timeoutMs, family: 4 }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks) }));
+      res.on("error", reject);
+    });
+    req.on("timeout", () => req.destroy(new Error("request timeout")));
+    req.on("error", reject);
+  });
+}
+
+// fnlttSinglAcnt(단일회사 주요계정)는 DART가 전 기업에 표준화해 제공하는 요약 계정과목이라
+// fnlttSinglAcntAll(전체 재무제표, 기업마다 XBRL 계정명이 제각각)보다 매칭이 안정적이다.
 export const ACCOUNT_MAP: Record<string, string[]> = {
   매출액: ["매출액", "매출액(수익)", "수익(매출액)", "영업수익", "매출"],
   영업이익: ["영업이익", "영업이익(손실)"],
-  당기순이익: [
-    "당기순이익",
-    "당기순이익(손실)",
-    "당기순이익(손실)(A)",
-    "분기순이익",
-    "반기순이익",
-  ],
+  당기순이익: ["당기순이익(손실)", "당기순이익", "분기순이익", "반기순이익"],
   자산총계: ["자산총계"],
   부채총계: ["부채총계"],
   자본총계: ["자본총계"],
 };
 
-// 계정명이 동일해도 재무제표구분(sj_div)별로 중복 등장할 수 있어(예: 손익계산서 vs 자본변동표)
-// 우선적으로 찾아야 할 sj_div 순서를 지정한다.
 const SJ_DIV_PREFERENCE: Record<string, string[]> = {
   매출액: ["IS", "CIS"],
   영업이익: ["IS", "CIS"],
@@ -29,6 +46,9 @@ const SJ_DIV_PREFERENCE: Record<string, string[]> = {
   부채총계: ["BS"],
   자본총계: ["BS"],
 };
+
+// fnlttSinglAcnt는 연결(CFS)·별도(OFS) 재무제표를 한 응답에 함께 반환하므로, 연결 우선으로 고른다.
+const FS_DIV_PREFERENCE = ["CFS", "OFS"];
 
 export type Metrics = Record<string, number | null>;
 export type Ratios = Record<string, number | null>;
@@ -74,11 +94,24 @@ async function getCorpList(apiKey: string): Promise<CorpEntry[]> {
 }
 
 async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
-  const res = await fetch(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`);
+  const t0 = Date.now();
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`, {
+      signal: AbortSignal.timeout(15000),
+      headers: DART_HEADERS,
+    });
+  } catch (err) {
+    console.log(`[dart] corpCode.xml fetch FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`);
+    throw err;
+  }
+  console.log(`[dart] corpCode.xml fetch: ${Date.now() - t0}ms, status=${res.status}`);
   if (!res.ok) {
     throw new Error(`corpCode 다운로드 실패 (HTTP ${res.status})`);
   }
+  const t1 = Date.now();
   const buffer = Buffer.from(await res.arrayBuffer());
+  console.log(`[dart] corpCode.xml buffer: ${Date.now() - t1}ms, size=${buffer.length}`);
 
   let xml: string;
   try {
@@ -93,6 +126,7 @@ async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
     );
   }
 
+  const t2 = Date.now();
   const parser = new XMLParser({ parseTagValue: false });
   const parsed = parser.parse(xml);
   const list = parsed?.result?.list ?? [];
@@ -101,6 +135,7 @@ async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
     corp_name: String(c.corp_name ?? "").trim(),
     stock_code: String(c.stock_code ?? "").trim(),
   }));
+  console.log(`[dart] corpCode.xml parse: ${Date.now() - t2}ms, entries=${entries.length}`);
 
   corpListCache = { entries, fetchedAt: Date.now() };
   return entries;
@@ -134,32 +169,38 @@ interface DartAccountRow {
   account_nm: string;
   thstrm_amount: string;
   sj_div: string;
+  fs_div: string;
 }
 
 async function fetchFinancials(
   apiKey: string,
   corpCode: string,
-  year: number,
-  fsDiv: "CFS" | "OFS"
-): Promise<{ rows: DartAccountRow[]; usedDiv: string }> {
-  const divsToTry = fsDiv === "CFS" ? ["CFS", "OFS"] : [fsDiv];
-
-  for (const div of divsToTry) {
-    const params = new URLSearchParams({
-      crtfc_key: apiKey,
-      corp_code: corpCode,
-      bsns_year: String(year),
-      reprt_code: REPRT_CODE_ANNUAL,
-      fs_div: div,
-    });
-    const res = await fetch(`${BASE_URL}/fnlttSinglAcntAll.json?${params.toString()}`);
-    if (!res.ok) continue;
-    const data = await res.json();
-    if (data.status === "000") {
-      return { rows: data.list as DartAccountRow[], usedDiv: div };
-    }
+  year: number
+): Promise<DartAccountRow[]> {
+  const params = new URLSearchParams({
+    crtfc_key: apiKey,
+    corp_code: corpCode,
+    bsns_year: String(year),
+    reprt_code: REPRT_CODE_ANNUAL,
+  });
+  const t0 = Date.now();
+  let status = 0;
+  let data: { status?: string; list?: DartAccountRow[] } | null = null;
+  try {
+    const { status: s, body } = await httpsGet(`${BASE_URL}/fnlttSinglAcnt.json?${params.toString()}`);
+    status = s;
+    data = status === 200 ? JSON.parse(body.toString("utf-8")) : null;
+  } catch (err) {
+    console.log(
+      `[dart] fnlttSinglAcnt ${corpCode} ${year} FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`
+    );
+    return [];
   }
-  return { rows: [], usedDiv: fsDiv };
+  console.log(
+    `[dart] fnlttSinglAcnt ${corpCode} ${year}: ${Date.now() - t0}ms, status=${status}, dartStatus=${data?.status}`
+  );
+  if (status !== 200 || !data || data.status !== "000") return [];
+  return (data.list ?? []) as DartAccountRow[];
 }
 
 function findAccountRow(
@@ -167,11 +208,16 @@ function findAccountRow(
   candidates: string[],
   sjDivPreference: string[]
 ): DartAccountRow | undefined {
-  for (const sjDiv of sjDivPreference) {
-    const match = rows.find(
-      (r) => r.sj_div === sjDiv && candidates.includes((r.account_nm || "").trim())
-    );
-    if (match) return match;
+  for (const fsDiv of FS_DIV_PREFERENCE) {
+    for (const sjDiv of sjDivPreference) {
+      const match = rows.find(
+        (r) =>
+          r.fs_div === fsDiv &&
+          r.sj_div === sjDiv &&
+          candidates.includes((r.account_nm || "").trim())
+      );
+      if (match) return match;
+    }
   }
   return rows.find((r) => candidates.includes((r.account_nm || "").trim()));
 }
@@ -209,8 +255,7 @@ function computeRatios(metrics: Metrics): Ratios {
 export async function analyzeCompany(
   apiKey: string,
   companyName: string,
-  years: number[],
-  fsDiv: "CFS" | "OFS" = "CFS"
+  years: number[]
 ): Promise<CompanyResult> {
   const warnings: string[] = [];
   const entries = await getCorpList(apiKey);
@@ -228,13 +273,14 @@ export async function analyzeCompany(
 
   const byYear: Record<number, YearData> = {};
   for (const year of years) {
-    const { rows, usedDiv } = await fetchFinancials(apiKey, found.corpCode, year, fsDiv);
+    const rows = await fetchFinancials(apiKey, found.corpCode, year);
     if (!rows.length) {
       warnings.push(`${found.name} ${year}년 재무제표 데이터를 찾을 수 없습니다.`);
       continue;
     }
     const metrics = extractKeyAccounts(rows);
     const ratios = computeRatios(metrics);
+    const usedDiv = rows.some((r) => r.fs_div === "CFS") ? "CFS" : "OFS";
     byYear[year] = { metrics, ratios, fsDiv: usedDiv };
   }
 
