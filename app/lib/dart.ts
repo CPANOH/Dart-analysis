@@ -1,6 +1,5 @@
-import AdmZip from "adm-zip";
-import { XMLParser } from "fast-xml-parser";
 import https from "node:https";
+import corpData from "@/app/data/corpcodes.json";
 
 const BASE_URL = "https://opendart.fss.or.kr/api";
 const REPRT_CODE_ANNUAL = "11011";
@@ -73,72 +72,11 @@ interface CorpEntry {
   stock_code: string;
 }
 
-let corpListCache: { entries: CorpEntry[]; fetchedAt: number } | null = null;
-let corpListInFlight: Promise<CorpEntry[]> | null = null;
-const CORP_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7일
-
-// 여러 회사를 동시에 조회할 때 corpCode.xml(약 8MB, 11만건 이상)을 중복 다운로드/파싱하지
-// 않도록 진행 중인 요청을 공유한다.
-async function getCorpList(apiKey: string): Promise<CorpEntry[]> {
-  if (corpListCache && Date.now() - corpListCache.fetchedAt < CORP_CACHE_TTL_MS) {
-    return corpListCache.entries;
-  }
-  if (corpListInFlight) {
-    return corpListInFlight;
-  }
-
-  corpListInFlight = fetchAndParseCorpList(apiKey).finally(() => {
-    corpListInFlight = null;
-  });
-  return corpListInFlight;
-}
-
-async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
-  const t0 = Date.now();
-  // fnlttSinglAcnt와 마찬가지로 corpCode.xml도 Vercel의 undici fetch가 멈추는 현상이
-  // 있어 node:https(IPv4 강제) 경로로 받는다. 약 8MB 대용량이라 타임아웃을 넉넉히 준다.
-  let status: number;
-  let buffer: Buffer;
-  try {
-    const r = await httpsGet(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`, 45000);
-    status = r.status;
-    buffer = r.body;
-  } catch (err) {
-    console.log(`[dart] corpCode.xml fetch FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`);
-    throw err;
-  }
-  console.log(`[dart] corpCode.xml fetch: ${Date.now() - t0}ms, status=${status}, size=${buffer.length}`);
-  if (status !== 200) {
-    throw new Error(`corpCode 다운로드 실패 (HTTP ${status})`);
-  }
-
-  let xml: string;
-  try {
-    const zip = new AdmZip(buffer);
-    const entry = zip.getEntries()[0];
-    xml = entry.getData().toString("utf-8");
-  } catch {
-    throw new Error(
-      `corpCode 응답이 zip 형식이 아닙니다. API 키를 확인하세요. 응답: ${buffer
-        .toString("utf-8")
-        .slice(0, 300)}`
-    );
-  }
-
-  const t2 = Date.now();
-  const parser = new XMLParser({ parseTagValue: false });
-  const parsed = parser.parse(xml);
-  const list = parsed?.result?.list ?? [];
-  const entries: CorpEntry[] = (Array.isArray(list) ? list : [list]).map((c) => ({
-    corp_code: String(c.corp_code ?? "").trim(),
-    corp_name: String(c.corp_name ?? "").trim(),
-    stock_code: String(c.stock_code ?? "").trim(),
-  }));
-  console.log(`[dart] corpCode.xml parse: ${Date.now() - t2}ms, entries=${entries.length}`);
-
-  corpListCache = { entries, fetchedAt: Date.now() };
-  return entries;
-}
+// DART는 클라우드 IP로의 corpCode.xml(3.5MB) 다운로드를 극심하게 스로틀링(~14KB/s)해서
+// Vercel 런타임에서는 사실상 받을 수 없다. 그래서 상장사 corp_code 매핑을 빌드 타임에 미리
+// 받아 저장한 번들(app/data/corpcodes.json)을 읽는다.
+// 갱신: `node scripts/gen-corpcodes.mjs` 실행 후 커밋.
+const corpEntries: CorpEntry[] = (corpData.companies as CorpEntry[]) ?? [];
 
 function findCorpCode(
   entries: CorpEntry[],
@@ -257,8 +195,7 @@ export async function analyzeCompany(
   years: number[]
 ): Promise<CompanyResult> {
   const warnings: string[] = [];
-  const entries = await getCorpList(apiKey);
-  const found = findCorpCode(entries, companyName);
+  const found = findCorpCode(corpEntries, companyName);
 
   if (!found) {
     return {
