@@ -54,13 +54,26 @@ interface CorpEntry {
 }
 
 let corpListCache: { entries: CorpEntry[]; fetchedAt: number } | null = null;
+let corpListInFlight: Promise<CorpEntry[]> | null = null;
 const CORP_CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7일
 
+// 여러 회사를 동시에 조회할 때 corpCode.xml(약 8MB, 11만건 이상)을 중복 다운로드/파싱하지
+// 않도록 진행 중인 요청을 공유한다.
 async function getCorpList(apiKey: string): Promise<CorpEntry[]> {
   if (corpListCache && Date.now() - corpListCache.fetchedAt < CORP_CACHE_TTL_MS) {
     return corpListCache.entries;
   }
+  if (corpListInFlight) {
+    return corpListInFlight;
+  }
 
+  corpListInFlight = fetchAndParseCorpList(apiKey).finally(() => {
+    corpListInFlight = null;
+  });
+  return corpListInFlight;
+}
+
+async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
   const res = await fetch(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`);
   if (!res.ok) {
     throw new Error(`corpCode 다운로드 실패 (HTTP ${res.status})`);

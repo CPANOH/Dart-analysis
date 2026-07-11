@@ -3,6 +3,8 @@ import { analyzeCompany, CompanyResult } from "@/app/lib/dart";
 import { buildWorkbook } from "@/app/lib/excel";
 
 export const maxDuration = 60;
+// DART(전자공시시스템)는 한국 소재 서버이므로 서울 리전에서 실행해 지연을 줄인다.
+export const preferredRegion = "icn1";
 
 function currentDefaultYears(): number[] {
   const y = new Date().getFullYear() - 1;
