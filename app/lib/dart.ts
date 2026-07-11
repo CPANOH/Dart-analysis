@@ -95,23 +95,22 @@ async function getCorpList(apiKey: string): Promise<CorpEntry[]> {
 
 async function fetchAndParseCorpList(apiKey: string): Promise<CorpEntry[]> {
   const t0 = Date.now();
-  let res: Response;
+  // fnlttSinglAcnt와 마찬가지로 corpCode.xml도 Vercel의 undici fetch가 멈추는 현상이
+  // 있어 node:https(IPv4 강제) 경로로 받는다. 약 8MB 대용량이라 타임아웃을 넉넉히 준다.
+  let status: number;
+  let buffer: Buffer;
   try {
-    res = await fetch(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`, {
-      signal: AbortSignal.timeout(15000),
-      headers: DART_HEADERS,
-    });
+    const r = await httpsGet(`${BASE_URL}/corpCode.xml?crtfc_key=${apiKey}`, 45000);
+    status = r.status;
+    buffer = r.body;
   } catch (err) {
     console.log(`[dart] corpCode.xml fetch FAILED after ${Date.now() - t0}ms: ${(err as Error).message}`);
     throw err;
   }
-  console.log(`[dart] corpCode.xml fetch: ${Date.now() - t0}ms, status=${res.status}`);
-  if (!res.ok) {
-    throw new Error(`corpCode 다운로드 실패 (HTTP ${res.status})`);
+  console.log(`[dart] corpCode.xml fetch: ${Date.now() - t0}ms, status=${status}, size=${buffer.length}`);
+  if (status !== 200) {
+    throw new Error(`corpCode 다운로드 실패 (HTTP ${status})`);
   }
-  const t1 = Date.now();
-  const buffer = Buffer.from(await res.arrayBuffer());
-  console.log(`[dart] corpCode.xml buffer: ${Date.now() - t1}ms, size=${buffer.length}`);
 
   let xml: string;
   try {
