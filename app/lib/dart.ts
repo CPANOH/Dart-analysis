@@ -271,9 +271,17 @@ export async function analyzeCompany(
     };
   }
 
+  // 연도별 조회를 병렬로 돌린다. 순차 조회 시 DART 응답이 느려지면 지연이 그대로
+  // 누적되어(최대 10개년 × 15초 타임아웃) Vercel 함수 제한(60초)을 넘기기 쉬웠다.
+  // 병렬화하면 최악의 경우도 "가장 느린 호출 1건"만큼만 걸린다.
   const byYear: Record<number, YearData> = {};
-  for (const year of years) {
-    const rows = await fetchFinancials(apiKey, found.corpCode, year);
+  const yearResults = await Promise.all(
+    years.map(async (year) => {
+      const rows = await fetchFinancials(apiKey, found.corpCode, year);
+      return { year, rows };
+    })
+  );
+  for (const { year, rows } of yearResults) {
     if (!rows.length) {
       warnings.push(`${found.name} ${year}년 재무제표 데이터를 찾을 수 없습니다.`);
       continue;

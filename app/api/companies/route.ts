@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { searchCompanies } from "@/app/lib/industry";
 import { searchByIndustryRanked } from "@/app/lib/naverIndustry";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
